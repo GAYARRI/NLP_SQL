@@ -1,18 +1,6 @@
 [
   {
-    "question": "ventas por categoria de pelicula",
-    "sql": "SELECT * FROM sales_by_film_category LIMIT 100"
-  },
-  {
-    "question": "clientes",
-    "sql": "SELECT * FROM customer LIMIT 100"
-  },
-  {
-    "question": "ventas por almacen",
-    "sql": "SELECT * FROM sales_by_store LIMIT 100"
-  },
-  {
-    "question": "ventas por categoria de peliculas",
-    "sql": "SELECT * FROM sales_by_film_category LIMIT 100"
+    "question": "cuenta actores por pelicula",
+    "sql": "SELECT film.title, COUNT(film_actor.actor_id) AS actor_count FROM film INNER JOIN film_actor ON film.film_id = film_actor.film_id GROUP BY film.film_id LIMIT 100"
   }
 ]

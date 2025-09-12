@@ -399,7 +399,8 @@ def _maybe_plot(headers, rows, force=False):
 
 # ------------------ Bucle interactivo ------------------
 
-def interactive_loop(db_path: str):
+def interactive_loop(db_path: str, schema_file: str | None = None, examples_file: str | None = None):
+
     # Conexión SQLite (solo lectura)
     global CHARTS_MODE
     conn = _connect_readonly(db_path)
@@ -538,12 +539,19 @@ def main():
         default="auto",
         help="Mostrar gráficos automáticamente cuando sea posible (auto|off)."
     )
+     
+    ap.add_argument(
+        "--examples-file",
+        default=None,
+        help="Ruta a un JSON con ejemplos few-shot (nl/sql)."
+    ) 
+
     args = ap.parse_args()
 
     global CHARTS_MODE
     CHARTS_MODE = args.charts
 
-    interactive_loop(args.db)
+    interactive_loop(args.db, examples_file=args.examples_file)
 
 
 if __name__ == "__main__":

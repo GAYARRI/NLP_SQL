@@ -1,4 +1,8 @@
-
+__pycache__/
+*.pyc
 .env
+.venv/
+.vscode/
+historial_nl_sql.json
+*.log
 
-.env
