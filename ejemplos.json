@@ -1,0 +1,77 @@
+[
+  {
+    "name": "Películas por categoría (Drama)",
+    "nl": "lista de películas de la categoría 'Drama'",
+    "sql": "SELECT f.title, c.name AS category FROM film f JOIN film_category fc ON fc.film_id = f.film_id JOIN category c ON c.category_id = fc.category_id WHERE c.name = 'Drama' ORDER BY f.title LIMIT 500"
+  },
+  {
+    "name": "Top 10 clientes por número de alquileres",
+    "nl": "clientes con más alquileres",
+    "sql": "SELECT c.customer_id, c.first_name || ' ' || c.last_name AS customer, COUNT(*) AS rentals FROM customer c JOIN rental r ON r.customer_id = c.customer_id GROUP BY c.customer_id ORDER BY rentals DESC LIMIT 500"
+  },
+  {
+    "name": "Ingresos por tienda",
+    "nl": "recaudación total por tienda",
+    "sql": "SELECT s.store_id, SUM(p.amount) AS revenue FROM store s JOIN staff st ON st.store_id = s.store_id JOIN payment p ON p.staff_id = st.staff_id GROUP BY s.store_id ORDER BY revenue DESC LIMIT 500"
+  },
+  {
+    "name": "Películas más alquiladas",
+    "nl": "top de películas más alquiladas",
+    "sql": "SELECT f.film_id, f.title, COUNT(*) AS rentals FROM film f JOIN inventory i ON i.film_id = f.film_id JOIN rental r ON r.inventory_id = i.inventory_id GROUP BY f.film_id ORDER BY rentals DESC LIMIT 500"
+  },
+  {
+    "name": "Duración media por categoría",
+    "nl": "duración media de las películas por categoría",
+    "sql": "SELECT c.name AS category, ROUND(AVG(f.length),1) AS avg_length FROM film f JOIN film_category fc ON fc.film_id = f.film_id JOIN category c ON c.category_id = fc.category_id GROUP BY c.name ORDER BY avg_length DESC LIMIT 500"
+  },
+  {
+    "name": "Clientes de un país (España)",
+    "nl": "clientes que viven en España",
+    "sql": "SELECT c.customer_id, c.first_name || ' ' || c.last_name AS customer FROM customer c JOIN address a ON a.address_id = c.address_id JOIN city ci ON ci.city_id = a.city_id JOIN country co ON co.country_id = ci.country_id WHERE co.name = 'Spain' ORDER BY customer LIMIT 500"
+  },
+  {
+    "name": "Alquileres por día (últimos 30 días)",
+    "nl": "número de alquileres por día en los últimos 30 días",
+    "sql": "SELECT DATE(r.rental_date) AS day, COUNT(*) AS rentals FROM rental r WHERE DATE(r.rental_date) >= DATE('now','-30 day') GROUP BY DATE(r.rental_date) ORDER BY day LIMIT 500"
+  },
+  {
+    "name": "Actores en películas que contienen 'Alien'",
+    "nl": "actores que aparecen en películas cuyo título contiene Alien",
+    "sql": "SELECT DISTINCT a.first_name || ' ' || a.last_name AS actor FROM actor a JOIN film_actor fa ON fa.actor_id = a.actor_id JOIN film f ON f.film_id = fa.film_id WHERE f.title LIKE '%Alien%' ORDER BY actor LIMIT 500"
+  },
+  {
+    "name": "Pago medio por rating de película",
+    "nl": "importe medio de pago por clasificación de película",
+    "sql": "SELECT f.rating, ROUND(AVG(p.amount),2) AS avg_amount FROM payment p JOIN rental r ON r.rental_id = p.rental_id JOIN inventory i ON i.inventory_id = r.inventory_id JOIN film f ON f.film_id = i.film_id GROUP BY f.rating ORDER BY avg_amount DESC LIMIT 500"
+  },
+  {
+    "name": "Clientes con alquileres sin devolver",
+    "nl": "clientes que aún no han devuelto algún alquiler",
+    "sql": "SELECT DISTINCT c.customer_id, c.first_name || ' ' || c.last_name AS customer FROM customer c JOIN rental r ON r.customer_id = c.customer_id WHERE r.return_date IS NULL ORDER BY customer LIMIT 500"
+  },
+   
+  {
+  "name": "Inventario por pais",
+  "nl": "inventario por pais",
+  "sql": "SELECT c.country, COUNT(i.inventory_id) AS total_inventario\nFROM inventory i\nJOIN store s ON i.store_id = s.store_id\nJOIN address a ON s.address_id = a.address_id\nJOIN city ci ON a.city_id = ci.city_id\nJOIN country c ON ci.country_id = c.country_id\nGROUP BY c.country\nORDER BY total_inventario DESC LIMIT 500"
+  },
+
+  {
+  "name": "Actores por categoria",
+  "nl": "actores por categoria de pelicula",
+  "sql": "SELECT c.name from category AS Nombre_Categoria,a.first_name AS Nombre_Actor,a.last_name AS Apellido_Actor FROM category JOIN film_category ON c.category_id=fc.category_id JOIN fa ON fc.film_id =fa.film_id JOIN actor ON fa.actor_id=a.actor_id LIMIT 500"
+  },
+
+  {
+  "name": "Numero de categorias por actor",
+  "nl": "categorias distintas por actor",
+  "sql":"SELECT a.first_name AS Nombre_Actor, a.last_name  AS Apellido_Actor, COUNT(DISTINCT c.name) AS Num_Categorias\nFROM actor a JOIN film_actor fa ON fa.actor_id = a.actor_id JOIN film_category fc  ON fc.film_id  = fa.film_id JOIN category c ON c.category_id = fc.category_id GROUP BY a.actor_id, a.first_name, a.last_name ORDER BY Num_Categorias DESCLIMIT 500;"
+  },
+
+  {
+  "name": "Numero de actores distintos por categoria",
+  "nl": "actores distintos por categoria",
+  "sql":"SELECT c.name AS Nombre_Categoria, COUNT(DISTINCT a.actor_id) AS Num_Actores FROM category c JOIN film_category fc ON fc.category_id = c.category_id JOIN film_actor fa ON fa.film_id = fc.film_id JOIN actor a ON a.actor_id = fa.actor_id GROUP BY c.category_id, c.name ORDER BY Num_Actores DESC LIMIT 500;" 
+ }
+
+]

@@ -10,9 +10,6 @@ from datetime import datetime
 from dateutil import parser as dtparser  # pip install python-dateutil
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib; print(matplotlib.get_backend())
-
-
 
 # Cargar .env: primero desde el cwd y, si no aparece, el .env junto al script
 dotenv_path = find_dotenv(usecwd=True)
@@ -32,11 +29,6 @@ client = OpenAI(api_key=api_key)
 import re, sqlite3, json, argparse, textwrap
 from tabulate import tabulate
 
-# --- Añadido Soporte CLI y comandos ---------------------------------------    
-
-
-
-
 # --- Configuración del LLM (OpenAI) ---
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # ajusta si lo deseas
 
@@ -55,7 +47,7 @@ Eres un traductor NL→SQL para SQLite. Reglas:
 - SOLO consultas SELECT (lectura). Prohibido: INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, REPLACE, ATTACH, DETACH, PRAGMA, VACUUM, TRIGGER.
 - No uses subconsultas peligrosas que escriban datos (no permitidas en SQLite).
 - NUNCA incluyas ';' al final.
-- Incluye siempre LIMIT razonable (por defecto 100) si el usuario no especifica límite.
+- Incluye un limite razonable aunque el usuario no especifique límite.
 - Usa exclusivamente tablas/columnas del esquema proporcionado.
 - Emplea parámetros literales directos (sin variables).
 - Si la pregunta no se puede responder con los datos disponibles, devuelve 'NO SE PUEDE RESOLVER LA PETICIÓN' y nada más.
@@ -91,7 +83,6 @@ def read_schema(conn: sqlite3.Connection) -> dict:
     objects = cur.fetchall()
     for name, kind in objects:
         cols = conn.execute(f"PRAGMA table_info('{name}')").fetchall()
-        # En vistas, PRAGMA foreign_key_list devuelve vacío (vistas no tienen FKs propias)
         fks = conn.execute(f"PRAGMA foreign_key_list('{name}')").fetchall() if kind == "table" else []
         schema[name] = {
             "kind": kind,
@@ -99,6 +90,7 @@ def read_schema(conn: sqlite3.Connection) -> dict:
             "foreign_keys": [{"from": fk[3], "table": fk[2], "to": fk[4]} for fk in fks],
         }
     return schema
+
 
 def schema_to_text(schema: dict) -> str:
     """
@@ -140,10 +132,123 @@ def schema_to_text(schema: dict) -> str:
 
     return "\n".join(lines)
 
+# ------------------ Lectura de ejemplos (con embeddings) ------------------
+
+def _load_examples(path: str | None) -> list[dict]:
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # formato esperado: [{"nl":"...","sql":"..."}, ...]
+        out = []
+        for e in data:
+            if isinstance(e, dict) and "nl" in e and "sql" in e:
+                out.append({"nl": str(e["nl"]), "sql": str(e["sql"])})
+        return out
+    except Exception as e:
+        print(f"[WARN] No se pudieron leer ejemplos de {path}: {e}")
+        return []
+
+# ===== Embeddings OpenAI =====
+EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [item.embedding for item in resp.data]
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    import math
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _ensure_example_embeddings(examples: list[dict], cache_path: str | None) -> list[dict]:
+    """Añade clave 'emb' a cada ejemplo. Usa caché JSON si se proporciona cache_path."""
+    if not examples:
+        return []
+
+    cache = {}
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    to_embed = []
+    for ex in examples:
+        nl = ex["nl"]
+        emb = None
+        if nl in cache:
+            emb = cache[nl]
+        if emb is None:
+            to_embed.append(nl)
+        else:
+            ex["emb"] = emb
+
+    if to_embed:
+        new_embs = _embed_texts(to_embed)
+        for nl, emb in zip(to_embed, new_embs):
+            cache[nl] = emb
+        # asignamos a los ejemplos que no tenían
+        for ex in examples:
+            if "emb" not in ex:
+                ex["emb"] = cache.get(ex["nl"])  # puede ser None si algo falló
+        # guardamos caché
+        if cache_path:
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+            except Exception as e:
+                print(f"[WARN] No se pudo guardar caché de embeddings: {e}")
+
+    return examples
+
+
+def _pick_examples_semantic(query: str, examples: list[dict], k: int = 3) -> list[dict]:
+    if not examples:
+        return []
+    # Embedding de la query
+    q_emb = _embed_texts([query])
+    if not q_emb:
+        return examples[:k]
+    qv = q_emb[0]
+    ranked = []
+    for ex in examples:
+        sim = 0.0
+        if "emb" in ex and isinstance(ex["emb"], list):
+            sim = _cosine_sim(qv, ex["emb"])
+        ranked.append((sim, ex))
+    ranked.sort(key=lambda t: t[0], reverse=True)
+    top = [ex for s, ex in ranked if s > 0][:k]
+    return top if top else [ex for _, ex in ranked][:k]
+
 # ------------------ LLM y ejecución segura ------------------
 
-def llm_generate_sql(client: OpenAI, schema_text: str, user_query: str) -> str:
-    """Pide al LLM la consulta SQL siguiendo las reglas."""
+def _examples_block(examples: list[dict]) -> str:
+    if not examples:
+        return ""
+    bloques = []
+    for ex in examples:
+        bloques.append(
+            "Entrada:\n" + ex["nl"] + "\nSalida esperada:\n" + ex["sql"]
+        )
+    return "\n\nEjemplos:\n" + "\n\n".join(bloques)
+
+
+def llm_generate_sql(client: OpenAI, schema_text: str, user_query: str, fewshots: list[dict] | None = None) -> str:
+    shots_txt = _examples_block(fewshots or [])
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTIONS.strip()},
         {
@@ -151,6 +256,8 @@ def llm_generate_sql(client: OpenAI, schema_text: str, user_query: str) -> str:
             "content": textwrap.dedent(f"""
             Esquema de la base de datos (tablas, vistas, columnas, PK y relaciones FK):
             {schema_text}
+
+            {shots_txt}
 
             Pregunta del usuario (español):
             {user_query}
@@ -163,19 +270,18 @@ def llm_generate_sql(client: OpenAI, schema_text: str, user_query: str) -> str:
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.0,
-        max_tokens=400,
+        max_tokens=500,
     )
     sql = resp.choices[0].message.content.strip()
-    # En caso de que el modelo devuelva código en bloque, lo limpiamos.
     if sql.startswith("```"):
         sql = re.sub(r"^```[a-zA-Z]*\n?", "", sql)
         sql = sql.rstrip("`").rstrip()
-    # Primera línea únicamente
     sql = sql.splitlines()[0].strip()
     return sql
 
+
 def validate_sql(sql: str):
-    """Aplica guardas de seguridad."""
+    """Aplica guardas de seguridad y añade LIMIT si falta."""
     if SQL_MULTISTMT.search(sql):
         raise ValueError("Se detectó ';' o múltiples sentencias. Solo una sentencia SELECT está permitida.")
     if SQL_FORBIDDEN.search(sql):
@@ -183,9 +289,9 @@ def validate_sql(sql: str):
     if not SQL_REQUIRE_SELECT.search(sql):
         raise ValueError("La consulta no es un SELECT.")
     if not SQL_REQUIRE_LIMIT.search(sql):
-        # Añade LIMIT 100 si faltase
-        sql += " LIMIT 100"
+        sql = sql + " LIMIT 500"
     return sql
+
 
 def run_query(conn: sqlite3.Connection, sql: str):
     cur = conn.execute(sql)
@@ -196,18 +302,16 @@ def run_query(conn: sqlite3.Connection, sql: str):
 # ------------------ Utilidades de inspección ------------------
 
 def _connect_readonly(db_path: str) -> sqlite3.Connection:
-    # Normaliza y valida la ruta
     p = Path(db_path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"No existe el archivo de BD: {p}")
-    # Conexión solo lectura vía URI (evita crear BD vacías)
     uri = f"file:{p.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def _print_schema_detail(conn: sqlite3.Connection, name: str):
-    # ¿Existe y qué tipo es?
     row = conn.execute(
         "SELECT name, type FROM sqlite_master WHERE name=? AND type IN ('table','view')",
         (name,)
@@ -235,13 +339,10 @@ def _print_schema_detail(conn: sqlite3.Connection, name: str):
         else:
             print("\n(Sin claves foráneas)")
 
+# ------------------ Helpers gráficos ------------------
 
-# ------------------ Helpers Punto2-------------
-
-
-# ---------- Detección de tipos ----------
 def _is_number(x):
-    if x is None: 
+    if x is None:
         return False
     try:
         float(x)
@@ -249,43 +350,34 @@ def _is_number(x):
     except (ValueError, TypeError):
         return False
 
+
 def _is_datetime(x):
     if x is None:
         return False
     if isinstance(x, (datetime,)):
         return True
-    # Intento de parseo “suave”
     try:
         dtparser.parse(str(x))
         return True
     except Exception:
         return False
 
+
 def _to_datetime(x):
     if isinstance(x, datetime):
         return x
     return dtparser.parse(str(x))
 
-# ---------- Elección de gráfico ----------
+
 def _choose_chart(headers, rows):
-    """
-    Decide un tipo de gráfico y qué columnas usar.
-    Retorna (kind, x_vals, y_vals, x_label, y_label) o None si no procede.
-    Reglas:
-      - 2 columnas numéricas -> scatter
-      - 1 datetime + 1 numérico -> line (ordenado por fecha)
-      - 1 categórica + 1 numérico -> bar (top N categorías)
-    """
     if not headers or not rows:
         return None
     if len(headers) < 2:
         return None
 
-    # Tomamos como base las dos primeras columnas útiles
-    cols = list(zip(*rows))  # columnas
+    cols = list(zip(*rows))
     H = list(headers)
 
-    # Buscamos pares viables (hasta 3 primeras columnas)
     max_cols = min(3, len(H))
     candidates = [(i, j) for i in range(max_cols) for j in range(max_cols) if i != j]
 
@@ -296,7 +388,6 @@ def _choose_chart(headers, rows):
         y_is_num = all(_is_number(v) for v in Y if v is not None)
         x_is_dt  = all(_is_datetime(v) for v in X if v is not None)
 
-        # (A) datetime + numérico -> línea temporal
         if x_is_dt and y_is_num:
             pairs = [(_to_datetime(a), float(b)) for a, b in zip(X, Y) if a is not None and _is_number(b)]
             if len(pairs) >= 2:
@@ -304,7 +395,6 @@ def _choose_chart(headers, rows):
                 xs, ys = zip(*pairs)
                 return ("line", xs, ys, H[i], H[j])
 
-        # (B) dos numéricos -> dispersión
         if x_is_num and y_is_num:
             xs = [float(v) for v in X if _is_number(v)]
             ys = [float(v) for v in Y if _is_number(v)]
@@ -312,7 +402,6 @@ def _choose_chart(headers, rows):
             if n >= 2:
                 return ("scatter", xs[:n], ys[:n], H[i], H[j])
 
-        # (C) categórica + numérico -> barras (agregamos media por categoría)
         if (not x_is_num and not x_is_dt) and y_is_num:
             buckets = {}
             for a, b in zip(X, Y):
@@ -321,7 +410,6 @@ def _choose_chart(headers, rows):
                 buckets.setdefault(str(a), []).append(float(b))
             if len(buckets) >= 2:
                 items = [(k, sum(v)/len(v)) for k, v in buckets.items()]
-                # top 20 categorías
                 items.sort(key=lambda t: t[1], reverse=True)
                 items = items[:20]
                 xs = [k for k, _ in items]
@@ -330,24 +418,19 @@ def _choose_chart(headers, rows):
 
     return None
 
+
 def _ensure_interactive_backend():
-    """Intenta asegurar un backend interactivo; si no, informa."""
     try:
         current = matplotlib.get_backend()
-        # Si estamos en modo 'Agg' (no interactivo), intentamos TkAgg
         if current.lower() == "agg":
             matplotlib.use("TkAgg")
     except Exception:
-        pass  # si falla, seguimos; plt.show() lo intentará igualmente
+        pass
+
 
 def _maybe_plot(headers, rows, force=False):
-    """
-    Intenta dibujar un gráfico en ventana flotante si hay datos adecuados
-    o si se fuerza con 'force=True'.
-    """
     if not rows or not headers:
         return False
-    # límite prudente para no bloquear con datos enormes
     if len(rows) > 5000 and not force:
         return False
 
@@ -361,7 +444,6 @@ def _maybe_plot(headers, rows, force=False):
         if decision:
             kind, xs, ys, xl, yl = decision
         else:
-            # Modo “fuerza bruta”: si hay 2 columnas, intenta scatter/line simple
             xs = list(range(len(rows)))
             ys = list(range(len(rows)))
             xl, yl, kind = "x", "y", "line"
@@ -369,7 +451,6 @@ def _maybe_plot(headers, rows, force=False):
         if kind == "line":
             plt.plot(xs, ys)
         elif kind == "bar":
-            # Para barras: rotamos etiquetas si son largas
             plt.bar(range(len(xs)), ys)
             plt.xticks(range(len(xs)), xs, rotation=45, ha="right")
         elif kind == "scatter":
@@ -387,35 +468,27 @@ def _maybe_plot(headers, rows, force=False):
         print(f"[WARN] No se pudo mostrar gráfico: {e}")
         return False
 
-
-
-
-
-
-
-
-
-
-
 # ------------------ Bucle interactivo ------------------
 
 def interactive_loop(db_path: str, schema_file: str | None = None, examples_file: str | None = None):
-
-    # Conexión SQLite (solo lectura)
-    global CHARTS_MODE
     conn = _connect_readonly(db_path)
 
-    # Log BD efectiva
     dblist = conn.execute("PRAGMA database_list").fetchall()
     print(f"[INFO] PRAGMA database_list -> {dblist}")
 
-    # Lee y renderiza esquema enriquecido
-    schema = read_schema(conn)
-    schema_text = schema_to_text(schema)
+    schema_dict = read_schema(conn)
+    schema_text = schema_to_text(schema_dict)
+
+    examples_all = _load_examples(examples_file)
+    # Precalcular embeddings y caché (junto al fichero de ejemplos)
+    cache_path = None
+    if examples_file:
+        cache_path = examples_file + ".embcache.json"
+    examples_all = _ensure_example_embeddings(examples_all, cache_path)
 
     print("Agente NL→SQL para SQLite (solo lectura). Escribe 'salir' para terminar.")
     print(f"BD: {db_path}")
-    print("Comandos: \\objects | \\tables | \\views | \\schema <nombre> | \\chart on | \\chart off")   #### Añadido 4   
+    print("Comandos: \\objects | \\tables | \\views | \\schema <nombre> | \\chart on | \\chart off")
     print("Objetos disponibles:")
     print(schema_text)
     print("-" * 60)
@@ -433,34 +506,22 @@ def interactive_loop(db_path: str, schema_file: str | None = None, examples_file
             if low in {"salir", "exit", "quit"}:
                 break
             if low == "\\chart on":
-                CHARTS_MODE = "auto"
+                globals()["CHARTS_MODE"] = "auto"
                 print("[INFO] Charts: auto")
                 continue
             if low == "\\chart off":
-                CHARTS_MODE = "off"
+                globals()["CHARTS_MODE"] = "off"
                 print("[INFO] Charts: off")
                 continue
-            # --- detectar intención de gráfico y limpiar query para el LLM ---
-            wants_chart = bool(re.search(r"\bgr[áa]fico(s)?\b", low))
-            nl_query = re.sub(r"\bgr[áa]fico(s)?\b", "", q, flags=re.IGNORECASE).strip()
-            #    si el usuario puso comillas alrededor de toda la frase, las quitamos
-            if (nl_query.startswith('"') and nl_query.endswith('"')) or (nl_query.startswith("'") and nl_query.endswith("'")):
-             nl_query = nl_query[1:-1].strip()
-
-            # Generar SQL (usar la pregunta LIMPIA)
-            sql_raw = llm_generate_sql(client, schema_text, nl_query)
-            sql = validate_sql(sql_raw)
-
-
             if low == "\\objects":
-                print(schema_to_text(schema))
+                print(schema_to_text(schema_dict))
                 continue
             if low == "\\tables":
-                only_tables = {k: v for k, v in schema.items() if v["kind"] == "table"}
+                only_tables = {k: v for k, v in schema_dict.items() if v["kind"] == "table"}
                 print(schema_to_text(only_tables))
                 continue
             if low == "\\views":
-                only_views = {k: v for k, v in schema.items() if v["kind"] == "view"}
+                only_views = {k: v for k, v in schema_dict.items() if v["kind"] == "view"}
                 print(schema_to_text(only_views))
                 continue
             if low.startswith("\\schema "):
@@ -468,25 +529,17 @@ def interactive_loop(db_path: str, schema_file: str | None = None, examples_file
                 _print_schema_detail(conn, name)
                 continue
 
-##############   Añadido 3 3ºPunto##############################################################
+            # Detección de intención de gráfico y limpieza de query
+            wants_chart = bool(re.search(r"\bgr[áa]fico(s)?\b", low))
+            nl_query = re.sub(r"\bgr[áa]fico(s)?\b", "", q, flags=re.IGNORECASE).strip()
+            if (nl_query.startswith('"') and nl_query.endswith('"')) or (nl_query.startswith("'") and nl_query.endswith("'")):
+                nl_query = nl_query[1:-1].strip()
 
-            low = q.lower()
+            # Selección de few-shots con similitud semántica (top-K)
+            fewshots = _pick_examples_semantic(nl_query, examples_all, k=3)
 
-            if low in {"salir", "exit", "quit"}:
-                break
-            if low == "\\chart on":
-                CHARTS_MODE = "auto"
-                print("[INFO] Charts: auto")
-                continue
-            if low == "\\chart off":
-                CHARTS_MODE = "off"
-                print("[INFO] Charts: off")
-                continue
-     
-###################################################################################################
-
-            # Generar SQL
-            sql_raw = llm_generate_sql(client, schema_text, q)
+            # Generar SQL con few-shots
+            sql_raw = llm_generate_sql(client, schema_text, nl_query, fewshots=fewshots)
             sql = validate_sql(sql_raw)
 
             # Ejecutar
@@ -500,33 +553,25 @@ def interactive_loop(db_path: str, schema_file: str | None = None, examples_file
             else:
                 print("(Sin resultados)")
 
+            # Gráfico opcional
+            if globals().get("CHARTS_MODE", "auto") == "auto":
+                force_plot = wants_chart
+                did = _maybe_plot(headers, rows, force=force_plot)
+                if did:
+                    print("[INFO] Gráfico mostrado (ventana flotante).")
 
-            ########################## plot opcional ###################################################
-
-            if CHARTS_MODE == "auto":
-               # Si el usuario escribió la palabra "grafico" en su pregunta, forzamos
-               force_plot = ("grafico" in low or "gráfico" in low)
-               did = _maybe_plot(headers, rows, force=force_plot)
-               if did:
-                  print("[INFO] Gráfico mostrado (ventana flotante).")
-
-            ##############################################################################################
-            
-            history.append({"question": q, "sql": sql})
+            history.append({"question": q, "sql": sql, "used_examples": fewshots})
         except Exception as e:
             print(f"Error: {e}")
 
-    # Cierre
     conn.close()
-    # Guarda historial básico
     with open("historial_nl_sql.json", "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
     print("\nHistorial guardado en historial_nl_sql.json")
 
-# ------------------ Añadido 3 al main ------------------
+# ------------------ main ------------------
 
 def main():
-    
     ap = argparse.ArgumentParser(description="Agente NL→SQL para SQLite (solo SELECT).")
     ap.add_argument(
         "--db",
@@ -539,19 +584,31 @@ def main():
         default="auto",
         help="Mostrar gráficos automáticamente cuando sea posible (auto|off)."
     )
-     
     ap.add_argument(
         "--examples-file",
         default=None,
-        help="Ruta a un JSON con ejemplos few-shot (nl/sql)."
-    ) 
+        help="Ruta a un JSON con ejemplos few-shot (claves: nl, sql)."
+    )
+    ap.add_argument(
+        "--schema-file",
+        default=None,
+        help="Ruta a un fichero .sql con el esquema (opcional, solo para referencia visual)."
+    )
 
     args = ap.parse_args()
 
-    global CHARTS_MODE
-    CHARTS_MODE = args.charts
+    globals()["CHARTS_MODE"] = args.charts
 
-    interactive_loop(args.db, examples_file=args.examples_file)
+    # El esquema_file se muestra solo como referencia; el esquema efectivo se extrae de la BD
+    if args.schema_file:
+        try:
+            with open(args.schema_file, "r", encoding="utf-8") as f:
+                preview = f.read(4000)
+            print("[INFO] Se cargó schema_file (vista previa 4k):\n" + preview[:4000])
+        except Exception as e:
+            print(f"[WARN] No se pudo leer {args.schema_file}: {e}")
+
+    interactive_loop(args.db, args.schema_file, args.examples_file)
 
 
 if __name__ == "__main__":
